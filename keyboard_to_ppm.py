@@ -103,7 +103,7 @@ def on_release(key):
     try:
         k = key.char
         if k in "1234567":
-            idx = int(k) - 1
+            idx = int(k) - 13
             if pressed[idx]:
                 pressed[idx] = False
     except:
