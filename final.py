@@ -54,23 +54,29 @@ class GesturePPMApp:
             self.ser = None
 
         # ----- Channel state -----
-        self.channels = [1500] * 8           # 8 通道初始值
-        self.pressed = [False] * 8           # index 0–6 对应按键 1–7
+        self.channels = [1500] * 8          # 8 channel initial values
+        self.channels[5] = 1441             # CH6 idle default
+        self.pressed = [False] * 8          # index 0–6 correspond to keys 1–7
         self.last_sent = self.channels.copy()
         self.lock = threading.Lock()
         self.running = True
 
-        # Sequence activation: tap 0, then 4/5/6
-        self.armed_special = False           # 是否已经点了 0（等待 4/5/6）
-        self.allowed_special = [False] * 8   # 当前这一轮按下的 4/5/6 是否被“授权”
+        # CH3 pulsing (0 -> 3): toggle between 1500 and 2180
+        self.ch3_pulse_state = False        # False = 1500, True = 2180
+        self.ch3_last_toggle = time.time()
+        self.ch3_pulse_interval = 0.1       # seconds between toggles (~5 Hz)
 
-        # 按下时的目标值 (index = 通道号 - 1)
+        # Sequence activation: tap 0, then 3/4/5/6
+        self.armed_special = False          # whether 0 has been tapped
+        self.allowed_special = [False] * 8  # whether specific key (3/4/5/6) is authorized this round
+
+        # Press target values (index = channel - 1)
         self.press_values = [2000] * 8
-        self.press_values[3] = 1700  # CH4: vibration
-        self.press_values[4] = 1000  # CH5: drop pin left
-        # CH6 (index 5) remains 2000 (Drop Right)
+        self.press_values[3] = 1700  # CH4: vibration (armed 0->4)
+        self.press_values[4] = 1500  # CH5 unused (always idle)
+        self.press_values[5] = 1500  # CH6 handled separately by keys 5/6
 
-        # 显示文字映射（前端）
+        # Display text mapping
         self.feature_names = {
             4: "Vibration",
             5: "Drop Pin · Left",
@@ -99,8 +105,8 @@ class GesturePPMApp:
         self.bar_rects = []
         self.bar_base_y = 0
         self.bar_max_height = 160
-        self.min_us = 1000
-        self.max_us = 2000
+        self.min_us = 500
+        self.max_us = 2500
 
         self.build_ui()
 
@@ -193,7 +199,7 @@ class GesturePPMApp:
         self.subtitle_text = self.canvas.create_text(
             w / 2,
             center_y + 40,
-            text="Press 1–7  ·  0 then 4/5/6 for actions",
+            text="Press 1–7  ·  0 then 3/4/5/6 for actions",
             fill="#8E8E93",
             font=("Helvetica", 16)
         )
@@ -244,7 +250,10 @@ class GesturePPMApp:
         )
 
         # ---- Helper text ----
-        helper = "1–3,7: gestures   •   0 → 4: Vibration   •   0 → 5: Drop Left   •   0 → 6: Drop Right   •   Esc/Q: exit"
+        helper = (
+            "1–3,7: gestures   •   0 → 3: Pulse   •   0 → 4: Vibration   "
+            "•   0 → 5: Drop Left   •   0 → 6: Drop Right   •   Esc/Q: exit"
+        )
         self.helper_text = self.canvas.create_text(
             w / 2,
             h - 40,
@@ -300,29 +309,29 @@ class GesturePPMApp:
             self.canvas.itemconfig(self.main_text, text="Armed")
             self.canvas.itemconfig(
                 self.subtitle_text,
-                text="0 tapped · Choose 4 / 5 / 6"
+                text="0 tapped · Choose 3 / 4 / 5 / 6"
             )
-            print("Activation tapped: waiting for 4/5/6")
+            print("Activation tapped: waiting for 3/4/5/6")
             return
 
         # Gesture keys 1–7
         if event.char in "1234567":
             idx = int(event.char) - 1
             with self.lock:
-                # 🔑 Ignore key auto-repeat: only handle first press
+                # Ignore key auto-repeat: only handle first press
                 if self.pressed[idx]:
                     return
 
                 self.pressed[idx] = True
 
-                # Special channels 4/5/6 (index 3, 4, 5) need 0→key sequence
-                if idx in (3, 4, 5):  # CH4, CH5, CH6
+                # Special channels 3/4/5/6 need 0→key sequence for special modes
+                if idx in (2, 3, 4, 5):  # CH3, CH4, CH5, CH6
                     if self.armed_special:
                         # Authorized for this press; consume the arm
                         self.allowed_special[idx] = True
                         self.armed_special = False
                     else:
-                        # Not armed: this press is NOT authorized
+                        # Not armed: this press is NOT authorized for special behavior
                         self.allowed_special[idx] = False
 
             self.show_gesture(event.char)
@@ -332,8 +341,8 @@ class GesturePPMApp:
             idx = int(event.char) - 1
             with self.lock:
                 self.pressed[idx] = False
-                if idx in (3, 4, 5):
-                    # One-shot: releasing 4/5/6 ends this authorized gesture
+                if idx in (2, 3, 4, 5):
+                    # One-shot: releasing 3/4/5/6 ends this authorized gesture
                     self.allowed_special[idx] = False
 
                 any_pressed = any(self.pressed)
@@ -344,9 +353,9 @@ class GesturePPMApp:
 
     def show_gesture(self, key_char: str):
         """
-        UI 显示：
-        - 4/5/6：显示功能名；如果没走 0→4/5/6 序列，则提示需要 0
-        - 1/2/3/7：显示 Gesture N
+        UI display:
+        - 4/5/6: show feature name; if no 0→key sequence, tell user it needs 0
+        - 1/2/3/7: show "Gesture N"
         """
         if not key_char or key_char not in "1234567":
             return
@@ -375,11 +384,11 @@ class GesturePPMApp:
         self.canvas.itemconfig(self.main_text, text="Waiting")
         self.canvas.itemconfig(
             self.subtitle_text,
-            text="Press 1–7  ·  0 then 4/5/6 for actions"
+            text="Press 1–7  ·  0 then 3/4/5/6 for actions"
         )
 
     def update_bars(self):
-        """定时从 channels[] 更新 8 个柱子的高度"""
+        """Periodic update from channels[] to 8 bar heights."""
         if not self.bar_rects:
             self.root.after(50, self.update_bars)
             return
@@ -413,27 +422,73 @@ class GesturePPMApp:
 
     def updater_loop(self):
         """
-        后台线程：
-        - CH1–3,7: 按下 → press_values[i]，松开 → 1500
-        - CH4–6: 必须先 0，再按 4/5/6，且在 allowed_special=True 且 pressed=True 时才输出 press_values
-          （PPM 只在按键释放后才回到 1500）
-        - CH8: 始终 1500
+        Background thread:
+        - CH1,2,7: press → press_values[i] (2000), release → 1500
+        - CH3: normal press → 2000; 0→3 → pulse between 1500 and 2180
+        - CH4: 0→4 required; armed+pressed → 1700, else 1500
+        - CH6: 0→5 = 735, 0→6 = 2180, else 1441 (CH5 idle)
+        - CH8: always 1500
         """
+        CH6_IDLE = 1441
+        CH6_LEFT = 735    # 0 -> 5
+        CH6_RIGHT = 2180  # 0 -> 6
+
         while self.running:
             changed = False
             with self.lock:
-                for i in range(7):  # CH1~CH7
-                    if i in (3, 4, 5):  # special channels
-                        active = self.pressed[i] and self.allowed_special[i]
-                    else:
-                        active = self.pressed[i]
+                # Standard channels (1,2,3,4,7)
+                for i in (0, 1, 2, 3, 6):
+                    if i == 2:
+                        # CH3: special pulsing when 0->3
+                        if self.pressed[2] and self.allowed_special[2]:
+                            now = time.time()
+                            if now - self.ch3_last_toggle >= self.ch3_pulse_interval:
+                                self.ch3_pulse_state = not self.ch3_pulse_state
+                                self.ch3_last_toggle = now
+                            target = 2180 if self.ch3_pulse_state else 1500
+                        elif self.pressed[2]:
+                            # Normal gesture 3
+                            self.ch3_pulse_state = False
+                            target = self.press_values[2]  # 2000
+                        else:
+                            # Idle
+                            self.ch3_pulse_state = False
+                            target = 1500
 
-                    target = self.press_values[i] if active else 1500
+                    elif i == 3:
+                        # CH4: requires arm (0 -> 4)
+                        active = self.pressed[3] and self.allowed_special[3]
+                        target = self.press_values[3] if active else 1500
+
+                    else:
+                        # CH1, CH2, CH7: simple press / idle
+                        active = self.pressed[i]
+                        target = self.press_values[i] if active else 1500
+
                     if self.channels[i] != target:
                         self.channels[i] = target
                         changed = True
 
-                # CH8 保持 1500
+                # CH5 unused, hold at 1500
+                if self.channels[4] != 1500:
+                    self.channels[4] = 1500
+                    changed = True
+
+                # CH6 driven by keys 5/6 (both require arm)
+                active_5 = self.pressed[4] and self.allowed_special[4]
+                active_6 = self.pressed[5] and self.allowed_special[5]
+                if active_6:
+                    target_ch6 = CH6_RIGHT
+                elif active_5:
+                    target_ch6 = CH6_LEFT
+                else:
+                    target_ch6 = CH6_IDLE
+
+                if self.channels[5] != target_ch6:
+                    self.channels[5] = target_ch6
+                    changed = True
+
+                # CH8 stays 1500
                 if self.channels[7] != 1500:
                     self.channels[7] = 1500
                     changed = True
