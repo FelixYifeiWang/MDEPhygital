@@ -27,9 +27,7 @@ def find_arduino_port():
         print(f"  {p.device} | {p.description} | VID={vid} PID={pid}")
 
         # Heuristic: Arduino-ish devices
-        if ("Arduino" in (p.description or "")) or \
-           ("usbmodem" in (p.device or "")) or \
-           ("usbserial" in (p.device or "")):
+        if ("Arduino" in (p.description or "")) or ("usbmodem" in p.device) or ("usbserial" in p.device) or (p.device == "COM3"):
             candidate = p.device
 
     if candidate:
