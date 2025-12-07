@@ -5,6 +5,11 @@ from serial.tools import list_ports
 import time
 import threading
 
+try:
+    import keyboard  # global hotkeys
+except ImportError:
+    keyboard = None
+
 
 BAUD_RATE = 115200
 
@@ -81,11 +86,16 @@ class GesturePPMApp:
             6: "Drop Pin · Right",
         }
 
+        # Global keyboard hook support
+        self.use_global_keyboard = keyboard is not None
+        self.kb_hook = None
+
         # ----- Tk UI -----
         self.root = tk.Tk()
         self.root.title("Gesture Console")
 
-        self.root.attributes("-fullscreen", True)
+        # Start in a windowed mode; still resizable by the user.
+        self.root.geometry("1200x800")
         self.root.configure(bg="#050508")
 
         self.canvas = Canvas(self.root, bg="#050508", highlightthickness=0)
@@ -108,10 +118,15 @@ class GesturePPMApp:
 
         self.build_ui()
 
-        # Key listeners
-        self.root.bind("<KeyPress>", self.on_key_press)
-        self.root.bind("<KeyRelease>", self.on_key_release)
-        self.root.focus_force()
+        # Key listeners (global if available, else Tk focus-based)
+        if self.use_global_keyboard:
+            self.kb_hook = keyboard.hook(self.on_global_event)
+            print("Using global keyboard hooks via 'keyboard' library.")
+        else:
+            self.root.bind("<KeyPress>", self.on_key_press)
+            self.root.bind("<KeyRelease>", self.on_key_release)
+            self.root.focus_force()
+            print("Global keyboard hook not available; falling back to focused window keys.")
 
         # Mouse for close button
         self.canvas.bind("<Button-1>", self.on_click)
@@ -197,7 +212,7 @@ class GesturePPMApp:
         self.subtitle_text = self.canvas.create_text(
             w / 2,
             center_y + 40,
-            text="Press 1–7  ·  0 then 3/4/5/6 for actions",
+            text="Press 1-7  ·  0 then 3/4/5/6 for actions",
             fill="#8E8E93",
             font=("Helvetica", 16)
         )
@@ -249,8 +264,8 @@ class GesturePPMApp:
 
         # ---- Helper text ----
         helper = (
-            "1–3,7: gestures   •   0 → 3: Pulse   •   0 → 4: Vibration   "
-            "•   0 → 5: Drop Left   •   0 → 6: Drop Right   •   Esc/Q: exit"
+            "Tap 0 to arm 3/4/5/6   |   0 + 3: Pulse   |   0 + 4: Vibration   "
+            "|   0 + 5: Drop Left   |   0 + 6: Drop Right   |   Esc/Q: exit"
         )
         self.helper_text = self.canvas.create_text(
             w / 2,
@@ -279,6 +294,12 @@ class GesturePPMApp:
     def on_close(self):
         self.running = False
         time.sleep(0.05)
+        if self.use_global_keyboard:
+            try:
+                if self.kb_hook:
+                    keyboard.unhook(self.kb_hook)
+            except Exception:
+                pass
         if self.ser is not None:
             try:
                 self.ser.close()
@@ -293,28 +314,32 @@ class GesturePPMApp:
         except Exception:
             pass
 
-    def on_key_press(self, event):
+    def handle_key_press(self, key_char: str, keysym: str = ""):
+        """Shared key-press handler for Tk events and global keyboard hook."""
+        char_lower = (key_char or "").lower()
+        keysym_lower = (keysym or "").lower()
+
         # Exit
-        if event.keysym == "Escape" or (event.char and event.char.lower() == "q"):
+        if keysym_lower in ("escape", "esc") or char_lower == "q":
             self.on_close()
             return
 
-        # Tap 0 → arm special actions
-        if event.char == "0":
+        # Tap 0 -> arm actions (3/4/5/6)
+        if char_lower == "0":
             with self.lock:
                 self.armed_special = True
             self.play_arm_sound()
             self.canvas.itemconfig(self.main_text, text="Armed")
             self.canvas.itemconfig(
                 self.subtitle_text,
-                text="0 tapped · Choose 3 / 4 / 5 / 6"
+                text="0 tapped · Choose 3/4/5/6"
             )
             print("Activation tapped: waiting for 3/4/5/6")
             return
 
         # Gesture keys 1–7
-        if event.char in "1234567":
-            idx = int(event.char) - 1
+        if char_lower in "1234567":
+            idx = int(char_lower) - 1
             with self.lock:
                 # Ignore key auto-repeat: only handle first press
                 if self.pressed[idx]:
@@ -322,21 +347,23 @@ class GesturePPMApp:
 
                 self.pressed[idx] = True
 
-                # Special channels 3/4/5/6 need 0→key sequence for special modes
-                if idx in (2, 3, 4, 5):  # CH3, CH4, CH5, CH6
+                # 3/4/5/6 need 0->key arming
+                if idx in (2, 3, 4, 5):
                     if self.armed_special:
                         # Authorized for this press; consume the arm
                         self.allowed_special[idx] = True
                         self.armed_special = False
                     else:
-                        # Not armed: this press is NOT authorized for special behavior
+                        # Not armed: this press is NOT authorized
                         self.allowed_special[idx] = False
 
-            self.show_gesture(event.char)
+            self.show_gesture(char_lower)
 
-    def on_key_release(self, event):
-        if event.char in "1234567":
-            idx = int(event.char) - 1
+    def handle_key_release(self, key_char: str):
+        """Shared key-release handler for Tk events and global keyboard hook."""
+        char_lower = (key_char or "").lower()
+        if char_lower in "1234567":
+            idx = int(char_lower) - 1
             with self.lock:
                 self.pressed[idx] = False
                 if idx in (2, 3, 4, 5):
@@ -347,13 +374,38 @@ class GesturePPMApp:
             if not any_pressed:
                 self.clear_gesture()
 
+    def on_key_press(self, event):
+        self.handle_key_press(event.char, getattr(event, "keysym", ""))
+
+    def on_key_release(self, event):
+        self.handle_key_release(event.char)
+
+    def on_global_event(self, event):
+        """Global keyboard event (from keyboard library). Handles press and release."""
+        name = getattr(event, "name", None)
+        etype = getattr(event, "event_type", "")
+        if not name or not etype:
+            return
+        key = name.lower()
+        if key.startswith("num "):  # handle numpad digits
+            key = key.split(" ", 1)[1]
+        if etype == "down":
+            if key in ("escape", "esc"):
+                self.handle_key_press("", "escape")
+            elif key == "q":
+                self.handle_key_press("q", "q")
+            elif key in "01234567":
+                self.handle_key_press(key, key)
+        elif etype == "up":
+            if key in "1234567":
+                self.handle_key_release(key)
+
     # =================== UI UPDATES =================== #
 
     def show_gesture(self, key_char: str):
         """
         UI display:
-        - 4/5/6: show feature name; if no 0→key sequence, tell user it needs 0
-        - 1/2/3/7: show "Gesture N"
+        - 3/4/5/6 require 0 + key arming; show hint if not armed
         """
         if not key_char or key_char not in "1234567":
             return
@@ -369,7 +421,15 @@ class GesturePPMApp:
             if allowed:
                 subtitle = f"Gesture {num} · {feature}"
             else:
-                subtitle = f"Gesture {num} · Need 0 → {num} to execute"
+                subtitle = f"Gesture {num} · Need 0 + {num} to execute"
+        elif num == 3:
+            main_text = "Gesture 3"
+            with self.lock:
+                allowed = self.allowed_special[2]
+            if allowed:
+                subtitle = "Gesture 3 · Pulse active"
+            else:
+                subtitle = "Gesture 3 · Need 0 + 3 to execute"
         else:
             main_text = f"Gesture {num}"
             subtitle = "Detected gesture"
@@ -382,7 +442,7 @@ class GesturePPMApp:
         self.canvas.itemconfig(self.main_text, text="Waiting")
         self.canvas.itemconfig(
             self.subtitle_text,
-            text="Press 1–7  ·  0 then 3/4/5/6 for actions"
+            text="Press 1-7  ·  0 then 3/4/5/6 for actions"
         )
 
     def update_bars(self):
@@ -416,15 +476,15 @@ class GesturePPMApp:
                     except Exception as e:
                         print(f"⚠️ Serial write error: {e}")
                 self.last_sent = self.channels.copy()
-                print(f"→ Sent: {line}")
+                print(f"Sent: {line}")
 
     def updater_loop(self):
         """
         Background thread:
-        - CH1,2,7: press → press_values[i] (2000), release → 1500
-        - CH3: normal press → 2000; 0→3 → pulse between 1500 and 2180
-        - CH4: 0→4 required; armed+pressed → 1700, else 1500
-        - CH6: 0→5 = 735, 0→6 = 2180, else 1441 (CH5 idle)
+        - CH1,2,7: press -> press_values[i] (2000), else 1500
+        - CH3: requires arm; 0+3 pulses between 1500 and 2180, otherwise idle
+        - CH4: requires arm; armed+pressed -> 1700, else 1500
+        - CH6: 0+5 = 735, 0+6 = 2180, else 1441 (CH5 idle)
         - CH8: always 1500
         """
         CH6_IDLE = 1441
@@ -444,12 +504,7 @@ class GesturePPMApp:
                                 self.ch3_pulse_state = not self.ch3_pulse_state
                                 self.ch3_last_toggle = now
                             target = 2180 if self.ch3_pulse_state else 1500
-                        elif self.pressed[2]:
-                            # Normal gesture 3
-                            self.ch3_pulse_state = False
-                            target = self.press_values[2]  # 2000
                         else:
-                            # Idle
                             self.ch3_pulse_state = False
                             target = 1500
 
